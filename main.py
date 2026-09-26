@@ -1,5 +1,6 @@
 """Play Othello on a Launchpad X."""
 
+import math
 import time
 
 import mido
@@ -15,6 +16,7 @@ PLAYER1_COLOR = (0, 0, 127)
 PLAYER2_COLOR = (127, 32, 0)
 VALID_MOVE_COLOR = (0, 20, 0)
 INVALID_MOVE_COLOR = (127, 0, 0)
+RESTART_DOUBLE_TAP_SECONDS = 0.5
 
 
 def xy_to_note(x: int, y: int) -> int:
@@ -52,6 +54,8 @@ class Othello:
         self.board[4][3] = self.PLAYER1
         self.board[4][4] = self.PLAYER2
         self.current_player = self.PLAYER1
+        self.finished = False
+        self.winner = None
 
     @staticmethod
     def inside(x: int, y: int) -> bool:
@@ -104,7 +108,13 @@ class Othello:
         if self.valid_moves(opponent):
             self.current_player = opponent
             return True
-        return bool(self.valid_moves(self.current_player))
+        if self.valid_moves(self.current_player):
+            return True
+        self.finished = True
+        player1_count, player2_count = self.count()
+        if player1_count != player2_count:
+            self.winner = self.PLAYER1 if player1_count > player2_count else self.PLAYER2
+        return False
 
     def count(self) -> tuple[int, int]:
         player1 = sum(row.count(self.PLAYER1) for row in self.board)
@@ -135,25 +145,78 @@ def update_display(game: Othello, port: mido.ports.BaseOutput) -> None:
             send_rgb(port, xy_to_note(x, y), color)
 
 
+def animate_valid_moves(
+    game: Othello, port: mido.ports.BaseOutput, elapsed: float
+) -> None:
+    """Pulse legal move pads smoothly without blocking MIDI input."""
+    brightness = round(
+        2 + 18 * (0.5 + 0.5 * math.sin(2 * math.pi * elapsed / 1.6))
+    )
+    color = (0, brightness, 0)
+    for x, y in game.valid_moves(game.current_player):
+        send_rgb(port, xy_to_note(x, y), color)
+
+
+def show_final_score(
+    game: Othello, port: mido.ports.BaseOutput, winner_visible: bool = True
+) -> None:
+    """Arrange one lit pad per stone, grouping the winner's score first."""
+    player1_count, player2_count = game.count()
+    if game.winner == game.PLAYER2:
+        first_player, first_count = game.PLAYER2, player2_count
+        second_player, second_count = game.PLAYER1, player1_count
+    else:
+        first_player, first_count = game.PLAYER1, player1_count
+        second_player, second_count = game.PLAYER2, player2_count
+
+    colors = {
+        game.PLAYER1: PLAYER1_COLOR,
+        game.PLAYER2: PLAYER2_COLOR,
+    }
+    pads = [
+        xy_to_note(x, y)
+        for y in range(BOARD_SIZE)
+        for x in range(BOARD_SIZE)
+    ]
+    for index, note in enumerate(pads):
+        if index < first_count:
+            color = (
+                colors[first_player]
+                if winner_visible or game.winner is None
+                else (0, 0, 0)
+            )
+        elif index < first_count + second_count:
+            color = colors[second_player]
+        else:
+            color = (0, 0, 0)
+        send_rgb(port, note, color)
+
+
 def flash_invalid(port: mido.ports.BaseOutput, note: int) -> None:
-    """Flash an invalid pad briefly."""
+    """Turn an invalid pad red; the event loop restores it later."""
     send_rgb(port, note, INVALID_MOVE_COLOR)
-    time.sleep(1)
 
 
-def handle_note(game: Othello, output_port: mido.ports.BaseOutput, note: int) -> None:
+def handle_note(
+    game: Othello, output_port: mido.ports.BaseOutput, note: int
+) -> bool | None:
+    """Handle a pad press; return whether it started an invalid flash."""
+    if game.finished:
+        return None
     position = note_to_xy(note)
     if position is None:
-        return
+        return None
 
     x, y = position
     if not game.put(x, y):
-        flash_invalid(output_port, note)
-        update_display(game, output_port)
-        return
+        return True
 
     game.next_turn()
-    update_display(game, output_port)
+    if game.finished:
+        show_final_score(game, output_port)
+    else:
+        update_display(game, output_port)
+    return False
 
 
 def main() -> None:
@@ -167,10 +230,57 @@ def main() -> None:
         update_display(game, output_port)
 
         try:
+            invalid_flash_until = None
+            animation_started = time.monotonic()
+            next_animation_frame = animation_started
+            next_result_frame = animation_started + 0.5
+            winner_visible = True
+            last_game_over_tap = None
             while True:
+                now = time.monotonic()
                 for message in input_port.iter_pending():
                     if message.type == "note_on" and message.velocity > 0:
-                        handle_note(game, output_port, message.note)
+                        if game.finished:
+                            if note_to_xy(message.note) is None:
+                                continue
+                            if (
+                                last_game_over_tap is not None
+                                and last_game_over_tap[0] == message.note
+                                and now - last_game_over_tap[1]
+                                <= RESTART_DOUBLE_TAP_SECONDS
+                            ):
+                                game = Othello()
+                                update_display(game, output_port)
+                                invalid_flash_until = None
+                                animation_started = now
+                                next_animation_frame = now
+                                winner_visible = True
+                                last_game_over_tap = None
+                            else:
+                                last_game_over_tap = (message.note, now)
+                            continue
+
+                        flash_started = handle_note(game, output_port, message.note)
+                        if flash_started is True:
+                            update_display(game, output_port)
+                            flash_invalid(output_port, message.note)
+                            invalid_flash_until = now + 1
+                        elif flash_started is False:
+                            invalid_flash_until = None
+                            if game.finished:
+                                next_result_frame = now + 0.5
+
+                if invalid_flash_until is not None and now >= invalid_flash_until:
+                    update_display(game, output_port)
+                    invalid_flash_until = None
+
+                if game.finished and game.winner is not None and now >= next_result_frame:
+                    winner_visible = not winner_visible
+                    show_final_score(game, output_port, winner_visible=winner_visible)
+                    next_result_frame = now + 0.5
+                elif not game.finished and now >= next_animation_frame:
+                    animate_valid_moves(game, output_port, now - animation_started)
+                    next_animation_frame = now + 0.04
                 time.sleep(0.01)
         except KeyboardInterrupt:
             pass
